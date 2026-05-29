@@ -1,106 +1,78 @@
 import requests
 import re
-import html as html_lib
 import json
 from pathlib import Path
+from typing import Optional
+from bs4 import BeautifulSoup
 
-URL = "https://www.ap7.se//vart-utbud/ap7-aktiefond/"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+URL = "https://www.ap7.se/vart-utbud/ap7-aktiefond/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 WANTED_KEYS = {"Marknadsvärde", "Position", "Valuta", "Valutakurs", "Pris/ränta"}
 JSON_FILE = Path("fund_data.json")
-
-# Matches "Innehav per 2025-12-31 (...)" in the page footer
-FOOTER_DATE_RE = re.compile(r'Innehav per\s*(\d{4}-\d{2}-\d{2})')
-
-# Fallback: matches "Datum: 2025-12-31" inside individual fold rows
-FOLD_DATE_RE = re.compile(r'Datum:\s*(\d{4}-\d{2}-\d{2})')
+DATE_RE = re.compile(r"Innehav per\s*(\d{4}-\d{2}-\d{2})")
 
 
-def clean(s: str) -> str:
-    return html_lib.unescape(re.sub(r'<[^>]+>', '', s)).strip()
+def fetch_html(url: str) -> str:
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
-def extract_footer_date(html_text: str) -> str | None:
-    """Extract the update date from the page footer, e.g. 'Innehav per 2025-12-31'."""
-    m = FOOTER_DATE_RE.search(html_text)
+def extract_date(html: str) -> Optional[str]:
+    """Extract date from 'Innehav per YYYY-MM-DD' in the page footer."""
+    m = DATE_RE.search(html)
     return m.group(1) if m else None
 
 
-def download_parse_table(url: str) -> tuple[dict, str | None]:
-    """Scrape the holdings table and return ({title: {key: value}}, date_string)."""
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    html_text = resp.text
+def parse_holdings(html: str) -> dict:
+    """Parse the holdings table and return {title: {key: value}}."""
+    soup = BeautifulSoup(html, "html.parser")
+    results = {}
 
-    # Pull the authoritative date from the page footer first
-    data_date = extract_footer_date(html_text)
-
-    block_re = re.compile(
-        r'(<tr[^>]*\bclass=["\']view["\'][\s\S]*?</tr>)\s*'
-        r'(<tr[^>]*\bclass=["\']fold["\'][\s\S]*?</tr>)',
-        flags=re.IGNORECASE,
-    )
-    pair_re = re.compile(
-        r'<div[^>]*\bclass=["\'][^"\'>]*\bfold-key\b[^"\'>]*["\'][^>]*>\s*(?P<key>.*?)\s*</div>.*?'
-        r'<div[^>]*\bclass=["\'][^"\'>]*\bfold-value\b[^"\'>]*["\'][^>]*>\s*(?P<value>.*?)\s*</div>',
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    results: dict[str, dict] = {}
-
-    for view_html, fold_html in block_re.findall(html_text):
-        # Extract holding title
-        title_m = re.search(
-            r'class=["\']title["\'][^>]*>\s*(.*?)\s*</',
-            view_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        ) or re.search(
-            r'class=["\']title["\'][^>]*>\s*(.*?)\s*</',
-            fold_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if not title_m:
+    for view_row in soup.find_all("tr", class_="view"):
+        # Title is in the view row
+        title_tag = view_row.find(class_="title")
+        if not title_tag:
+            continue
+        title = title_tag.get_text(strip=True)
+        if not title or title in results:
             continue
 
-        title = clean(title_m.group(1))
-        if title in results:
-            print(f"Warning: duplicate title '{title}', skipping later occurrence.")
+        # The fold row immediately follows the view row
+        fold_row = view_row.find_next_sibling("tr", class_="fold")
+        if not fold_row:
             continue
 
-        # Fallback: try to pick up a date from the fold row if footer gave nothing
-        if data_date is None:
-            fold_date_m = FOLD_DATE_RE.search(fold_html)
-            if fold_date_m:
-                data_date = fold_date_m.group(1)
+        # Pair up fold-key and fold-value divs
+        keys = [d.get_text(strip=True) for d in fold_row.find_all(class_="fold-key")]
+        vals = [d.get_text(strip=True) for d in fold_row.find_all(class_="fold-value")]
 
-        # Extract wanted key/value pairs
-        entry: dict[str, str] = {}
-        for k, v in pair_re.findall(fold_html):
-            k_clean, v_clean = clean(k), clean(v)
-            if k_clean in WANTED_KEYS and k_clean not in entry:
-                entry[k_clean] = v_clean
+        entry = {}
+        for k, v in zip(keys, vals):
+            if k in WANTED_KEYS and k not in entry:
+                entry[k] = v
 
         results[title] = entry
 
-    return results, data_date
+    return results
 
 
-def update_json_store(
-    new_data: dict,
-    data_date: str | None,
-    filename: Path = JSON_FILE,
-) -> None:
-    """Append new data to the JSON file for data_date; skip if that date already exists."""
-    if data_date is None:
-        raise ValueError(
-            "Could not extract a date from the page. "
-            "The site layout may have changed — check FOOTER_DATE_RE."
-        )
-
-    store: dict = {}
+def update_json_store(new_data: dict, data_date: str, filename: Path = JSON_FILE) -> None:
+    """Append new holdings to the JSON file; skip entirely if date already exists."""
+    store = {}
     if filename.exists():
         with open(filename, "r", encoding="utf-8") as f:
             store = json.load(f)
+
+    # Check if this date is already stored (sample the first entry)
+    sample = next(iter(store.values()), {})
+    if data_date in sample:
+        print(f"Date {data_date} already in {filename} — nothing to do.")
+        return
 
     added = skipped = 0
     for title, values in new_data.items():
@@ -114,13 +86,34 @@ def update_json_store(
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2, ensure_ascii=False)
 
-    print(f"Date extracted : {data_date}")
+    print(f"Date           : {data_date}")
     print(f"Output file    : {filename}")
+    print(f"Holdings found : {len(new_data)}")
     print(f"Added          : {added} entries")
-    print(f"Skipped        : {skipped} entries (already stored for this date)")
+    print(f"Skipped        : {skipped} entries (already stored)")
 
 
-# ── Run ──────────────────────────────────────────────────────────────────────
+# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parsed_data, html_date = download_parse_table(URL)
-    update_json_store(parsed_data, html_date)
+    html = fetch_html(URL)
+
+    data_date = extract_date(html)
+    if data_date is None:
+        raise ValueError("Could not find date on page — site layout may have changed.")
+    print(f"Date on website: {data_date}")
+
+    # Early exit before parsing if date is already stored
+    if JSON_FILE.exists():
+        with open(JSON_FILE, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        sample = next(iter(existing.values()), {})
+        print(sample)
+        if data_date in sample:
+            print(f"Already up to date — no changes made.")
+            exit(0)
+
+    holdings = parse_holdings(html)
+    if not holdings:
+        raise ValueError("No holdings parsed — the table structure may have changed.")
+
+    update_json_store(holdings, data_date)
