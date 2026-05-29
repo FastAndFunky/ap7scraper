@@ -86,6 +86,9 @@ def update_json_store(new_data: dict, data_date: str, filename: Path = JSON_FILE
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2, ensure_ascii=False)
 
+    # Sentinel file tells the CI workflow that new data was written
+    Path(".data_updated").touch()
+
     print(f"Date           : {data_date}")
     print(f"Output file    : {filename}")
     print(f"Holdings found : {len(new_data)}")
@@ -107,7 +110,6 @@ if __name__ == "__main__":
         with open(JSON_FILE, "r", encoding="utf-8") as f:
             existing = json.load(f)
         sample = next(iter(existing.values()), {})
-        print(sample)
         if data_date in sample:
             print(f"Already up to date — no changes made.")
             exit(0)
